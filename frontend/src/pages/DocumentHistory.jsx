@@ -48,21 +48,16 @@ const DocumentHistory = () => {
   const executeSecureAction = async (type, index, config = {}) => {
   try {
     if (type === "view") {
-      const res = await API.get(
-        `/documents/${id}/history/${index}/view`,
-        { ...config, responseType: "blob" }
-      );
-      window.open(URL.createObjectURL(res.data));
+      const res = await API.get(`/documents/${id}/history/${index}/view`, config);
+      window.open(res.data.url, "_blank");
     }
 
     if (type === "download") {
-      const res = await API.get(
-        `/documents/${id}/history/${index}/download`,
-        { ...config, responseType: "blob" }
-      );
+      const res = await API.get(`/documents/${id}/history/${index}/download`, config);
 
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(res.data);
+      a.href = res.data.url;
+      a.target = "_blank";
       a.download = history[index]?.filename || "file";
       a.click();
     }

@@ -119,31 +119,18 @@ const handleGenerate = async (type) => {
   try {
     setLoading(true);
 
-    const response = await fetch(
-      `http://localhost:5000/api/annexure2/${type}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(formData),
-      }
-    );
+    const response = await API.post(`/annexure2/${type}`, formData);
+    const { fileName } = response.data;
 
-    const result = await response.json();
-
-    if (response.ok) {
-      window.open(
-        `http://localhost:5000/api/annexure2/download/${result.fileName}`,
-        "_blank"
-      );
-    } else {
-      alert("Generation failed");
+    if (!fileName) {
+      throw new Error("No filename returned from server");
     }
 
+    const downloadUrl = `${API.defaults.baseURL}/annexure2/download/${fileName}`;
+    window.open(downloadUrl, "_blank");
   } catch (error) {
-    console.error(error);
-    alert("Server error");
+    console.error("Annexure 2 generation failed", error);
+    alert(error.response?.data?.message || "Generation failed");
   } finally {
     setLoading(false);
   }

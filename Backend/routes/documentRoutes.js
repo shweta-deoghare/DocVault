@@ -3,7 +3,9 @@ import multer from "multer";
 import mongoose from "mongoose";
 import { isAuth } from "../middleware/auth.js";
 import Document from "../models/Document.js";
-import { minioClient } from "../config/minio.js";
+import { s3Client } from "../config/s3.js";
+import { PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Notification from "../models/Notification.js";
 import User from "../models/User.js";
 import bcrypt from "bcryptjs";
@@ -11,12 +13,11 @@ import dotenv from "dotenv";
 import { transporter } from "../utils/mailer.js";
 dotenv.config();
 
-const BUCKET = process.env.MINIO_BUCKET; // make sure this exists in your .env
+const BUCKET = process.env.AWS_BUCKET_NAME;
+const SIGNED_URL_EXPIRY = 900; // 15 minutes
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
-
-
 
 /* ================= VAULT MIDDLEWARE ================= */
 const checkVaultAccess = async (req, res, next) => {
@@ -27,8 +28,6 @@ const checkVaultAccess = async (req, res, next) => {
     if (!user.vaultLocked) return next();
 
     const vaultKey = req.headers.vaultkey;
-    console.log("Header Key:", vaultKey, "Stored Hash:", user.vaultKey);
-
     if (!vaultKey) return res.status(403).json({ message: "Vault is locked. Enter encryption key." });
 
     const valid = await bcrypt.compare(vaultKey, user.vaultKey);
@@ -119,7 +118,7 @@ const hasPermission = (doc, userId, userRole, action) => {
 
 /* ================= DOCUMENT ROUTES ================= */
 
-// GET DOCUMENTS
+// GET ALL DOCUMENTS
 router.get("/", isAuth, async (req, res) => {
   try {
     const { categoryId, search, fileType, userId } = req.query;
@@ -151,7 +150,13 @@ router.post("/upload", isAuth, checkVaultAccess, upload.single("file"), async (r
     if (!file || !categoryId) return res.status(400).json({ message: "File and category required" });
 
     const objectName = `${Date.now()}-${file.originalname}`;
-    await minioClient.putObject(BUCKET, objectName, file.buffer);
+
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: objectName,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    }));
 
     const document = await Document.create({
       filename: file.originalname,
@@ -169,7 +174,7 @@ router.post("/upload", isAuth, checkVaultAccess, upload.single("file"), async (r
   }
 });
 
-// VIEW DOCUMENT
+// VIEW DOCUMENT — presigned URL (opens in browser)
 router.get("/:id/view", isAuth, checkVaultAccess, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
@@ -177,16 +182,21 @@ router.get("/:id/view", isAuth, checkVaultAccess, async (req, res) => {
     if (!hasPermission(doc, req.userId, req.userRole, "view"))
       return res.status(403).json({ message: "Permission denied" });
 
-    const stream = await minioClient.getObject(BUCKET, doc.minioPath);
-    res.setHeader("Content-Type", doc.mimetype);
-    stream.pipe(res);
+    const command = new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: doc.minioPath,
+    });
+
+    const url = await getSignedUrl(s3Client, command, { expiresIn: SIGNED_URL_EXPIRY });
+
+    res.json({ url });
   } catch (err) {
     console.error("VIEW ERROR:", err);
     res.status(500).json({ message: "Failed to view document", error: err.message });
   }
 });
 
-// DOWNLOAD DOCUMENT
+// DOWNLOAD DOCUMENT — presigned URL (forces download)
 router.get("/:id/download", isAuth, checkVaultAccess, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
@@ -194,10 +204,15 @@ router.get("/:id/download", isAuth, checkVaultAccess, async (req, res) => {
     if (!hasPermission(doc, req.userId, req.userRole, "download"))
       return res.status(403).json({ message: "Permission denied" });
 
-    const stream = await minioClient.getObject(BUCKET, doc.minioPath);
-    res.setHeader("Content-Type", doc.mimetype);
-    res.setHeader("Content-Disposition", `attachment; filename="${doc.filename}"`);
-    stream.pipe(res);
+    const command = new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: doc.minioPath,
+      ResponseContentDisposition: `attachment; filename="${doc.filename}"`,
+    });
+
+    const url = await getSignedUrl(s3Client, command, { expiresIn: SIGNED_URL_EXPIRY });
+
+    res.json({ url });
   } catch (err) {
     console.error("DOWNLOAD ERROR:", err);
     res.status(500).json({ message: "Failed to download document", error: err.message });
@@ -216,8 +231,15 @@ router.put("/:id/replace", isAuth, checkVaultAccess, upload.single("file"), asyn
     if (!file) return res.status(400).json({ message: "File required" });
 
     const objectName = `${Date.now()}-${file.originalname}`;
-    await minioClient.putObject(BUCKET, objectName, file.buffer);
 
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: objectName,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    }));
+
+    // Save current version to history before replacing
     doc.history.push({
       filename: doc.filename,
       minioPath: doc.minioPath,
@@ -237,7 +259,7 @@ router.put("/:id/replace", isAuth, checkVaultAccess, upload.single("file"), asyn
   }
 });
 
-// HISTORY VIEW/DOWNLOAD
+// HISTORY VIEW — presigned URL (opens in browser)
 router.get("/:id/history/:index/view", isAuth, checkVaultAccess, async (req, res) => {
   try {
     const { id, index } = req.params;
@@ -245,15 +267,22 @@ router.get("/:id/history/:index/view", isAuth, checkVaultAccess, async (req, res
     if (!doc || !doc.history[index]) return res.status(404).json({ message: "History not found" });
 
     const item = doc.history[index];
-    const stream = await minioClient.getObject(BUCKET, item.minioPath);
-    res.setHeader("Content-Type", item.mimetype);
-    stream.pipe(res);
+
+    const command = new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: item.minioPath,
+    });
+
+    const url = await getSignedUrl(s3Client, command, { expiresIn: SIGNED_URL_EXPIRY });
+
+    res.json({ url });
   } catch (err) {
     console.error("HISTORY VIEW ERROR:", err);
     res.status(500).json({ message: "Failed to view history", error: err.message });
   }
 });
 
+// HISTORY DOWNLOAD — presigned URL (forces download)
 router.get("/:id/history/:index/download", isAuth, checkVaultAccess, async (req, res) => {
   try {
     const { id, index } = req.params;
@@ -261,15 +290,23 @@ router.get("/:id/history/:index/download", isAuth, checkVaultAccess, async (req,
     if (!doc || !doc.history[index]) return res.status(404).json({ message: "History not found" });
 
     const item = doc.history[index];
-    const stream = await minioClient.getObject(BUCKET, item.minioPath);
-    res.setHeader("Content-Type", item.mimetype);
-    res.setHeader("Content-Disposition", `attachment; filename="${item.filename}"`);
-    stream.pipe(res);
+
+    const command = new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: item.minioPath,
+      ResponseContentDisposition: `attachment; filename="${item.filename}"`,
+    });
+
+    const url = await getSignedUrl(s3Client, command, { expiresIn: SIGNED_URL_EXPIRY });
+
+    res.json({ url });
   } catch (err) {
     console.error("HISTORY DOWNLOAD ERROR:", err);
     res.status(500).json({ message: "Failed to download history", error: err.message });
   }
 });
+
+// BULK DELETE
 router.delete("/bulk-delete", isAuth, checkVaultAccess, async (req, res) => {
   try {
     const { documentIds } = req.body;
@@ -290,45 +327,36 @@ router.delete("/bulk-delete", isAuth, checkVaultAccess, async (req, res) => {
     // Permission check
     for (const doc of documents) {
       if (role !== "admin" && doc.userId.toString() !== userId.toString()) {
-        return res.status(403).json({
-          message: "You can delete only your own documents",
-        });
+        return res.status(403).json({ message: "You can delete only your own documents" });
       }
     }
 
-    // MinIO delete (SAFE)
+    // Delete from S3
     for (const doc of documents) {
       if (doc.minioPath && BUCKET) {
         try {
-          await minioClient.removeObject(BUCKET, doc.minioPath);
+          await s3Client.send(new DeleteObjectCommand({
+            Bucket: BUCKET,
+            Key: doc.minioPath,
+          }));
         } catch (err) {
-          console.error("MINIO DELETE ERROR:", err.message);
-          // DO NOT THROW — continue deleting DB record
+          console.error("S3 DELETE ERROR:", err.message);
+          // continue even if S3 delete fails
         }
       }
     }
 
-    // Mongo delete
+    // Delete from MongoDB
     await Document.deleteMany({ _id: { $in: documentIds } });
 
-    res.json({
-      message: "Documents deleted successfully",
-      deletedCount: documents.length,
-    });
-
+    res.json({ message: "Documents deleted successfully", deletedCount: documents.length });
   } catch (err) {
     console.error("BULK DELETE ERROR:", err);
-    res.status(500).json({
-      message: "Failed to delete documents",
-      error: err.message,
-    });
+    res.status(500).json({ message: "Failed to delete documents", error: err.message });
   }
 });
 
-
-
-
-// DELETE DOCUMENT
+// DELETE SINGLE DOCUMENT
 router.delete("/:id", isAuth, checkVaultAccess, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
@@ -336,7 +364,13 @@ router.delete("/:id", isAuth, checkVaultAccess, async (req, res) => {
     if (req.userRole !== "admin" && doc.userId.toString() !== req.userId)
       return res.status(403).json({ message: "Access denied" });
 
-    if (doc.minioPath) await minioClient.removeObject(BUCKET, doc.minioPath);
+    if (doc.minioPath) {
+      await s3Client.send(new DeleteObjectCommand({
+        Bucket: BUCKET,
+        Key: doc.minioPath,
+      }));
+    }
+
     await Document.deleteOne({ _id: doc._id });
 
     res.json({ message: "Document deleted successfully" });
@@ -346,31 +380,23 @@ router.delete("/:id", isAuth, checkVaultAccess, async (req, res) => {
   }
 });
 
-// BULK DELETE
-
-// =================== GET ALL DOCUMENTS ===================
-// ==============
-// =================== GET ASSIGNED DOCUMENTS ===================
-// =================== GET ASSIGNED DOCUMENTS ===================
+// GET ASSIGNED DOCUMENTS
 router.get("/assigned", isAuth, async (req, res) => {
   try {
-    const { userId } = req.query; // selected user in admin panel
+    const { userId } = req.query;
 
     if (!userId && req.userRole !== "user") {
       return res.status(400).json({ message: "userId is required for admin" });
     }
 
-    // For normal users, fetch their own assigned docs
     const targetUserId = req.userRole === "user" ? req.userId : userId;
 
-    // Find documents where the target user is in the assignedTo array
     const documents = await Document.find({ "assignedTo.userId": targetUserId })
       .sort({ createdAt: -1 })
       .populate("categoryId", "name")
       .populate("userId", "firstname lastname email")
       .populate("assignedTo.userId", "firstname lastname email");
 
-    // Filter assignedTo array to only include the target user
     const filteredDocs = documents.map((doc) => {
       const assignedEntry = doc.assignedTo.find(
         (a) => a.userId._id.toString() === targetUserId
@@ -385,34 +411,26 @@ router.get("/assigned", isAuth, async (req, res) => {
       };
     });
 
-    console.log("ASSIGNED DOCS FOR USER:", filteredDocs);
     res.json(filteredDocs);
   } catch (err) {
     console.error("ASSIGNED DOCS ERROR:", err);
     res.status(500).json({ message: "Failed to fetch assigned documents" });
   }
 });
-// ✅ ADMIN: fetch assigned docs for ANY user
-// GET assigned documents for a specific user (ADMIN VIEW)
-// GET assigned docs for a particular user (ADMIN)
-// GET assigned docs for a particular user (ADMIN)
+
+// GET ASSIGNED DOCUMENTS BY USER (admin)
 router.get("/assigned/by-user/:userId", isAuth, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const docs = await Document.find({
-      "assignedTo.userId": userId,
-    })
+    const docs = await Document.find({ "assignedTo.userId": userId })
       .populate("categoryId")
       .populate("userId")
       .lean();
 
-    // 🔥 KEEP ONLY THIS USER IN assignedTo
     const filteredDocs = docs.map(doc => ({
       ...doc,
-      assignedTo: doc.assignedTo.filter(
-        a => String(a.userId) === String(userId)
-      )
+      assignedTo: doc.assignedTo.filter(a => String(a.userId) === String(userId))
     }));
 
     res.json(filteredDocs);
@@ -421,6 +439,36 @@ router.get("/assigned/by-user/:userId", isAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch assigned docs" });
   }
 });
+
+// GET ASSIGNED DOCUMENTS BY PARAM USER ID
+router.get("/assigned/:userId", isAuth, async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const docs = await Document.find({ "assignedTo.userId": userId })
+      .populate("categoryId")
+      .populate("userId");
+
+    res.json(docs);
+  } catch (err) {
+    console.error("ASSIGNED PARAM ERROR:", err);
+    res.status(500).json({ message: "Failed to fetch assigned documents" });
+  }
+});
+
+// GET HISTORY
+router.get("/history/:id", async (req, res) => {
+  try {
+    const doc = await Document.findById(req.params.id);
+    if (!doc) return res.status(404).json({ message: "Document not found" });
+
+    res.json(doc.history);
+  } catch {
+    res.status(500).json({ message: "Failed to fetch history" });
+  }
+});
+
+// DELETE HISTORY ITEM
 router.delete("/history/:docId/:index", async (req, res) => {
   try {
     const { docId, index } = req.params;
@@ -436,63 +484,23 @@ router.delete("/history/:docId/:index", async (req, res) => {
     res.status(500).json({ message: "Delete failed" });
   }
 });
-router.get("/history/:id", async (req, res) => {
-  try {
-    const doc = await Document.findById(req.params.id);
-    if (!doc) return res.status(404).json({ message: "Document not found" });
 
-    res.json(doc.history);
-  } catch {
-    res.status(500).json({ message: "Failed to fetch history" });
-  }
-});
-// GET documents assigned to a specific user
-router.get("/assigned/:userId", isAuth, async (req, res) => {
-  const { userId } = req.params;
-
-  const docs = await Document.find({
-    "assignedTo.userId": userId
-  })
-    .populate("categoryId")
-    .populate("userId");
-
-  res.json(docs);
-});
-// =================== VIEW DOCUMENT ===================
-
-// =================== REPLACE DOCUMENT ===================
-// =================== REPLACE DOCUMENT ===================
-// REPLACE DOCUMENT
-
-// VIEW HISTORY ITEM
-// =================== ASSIGN DOCUMENT ===================
-// =================== ASSIGN DOCUMENT ===================
-// =================== ASSIGN DOCUMENT ===================
+// ASSIGN DOCUMENT
 router.post("/:id/assign", isAuth, async (req, res) => {
   try {
-    console.log("📥 BODY RECEIVED:", req.body);
-
     const { assignments, sendEmail } = req.body;
 
-    console.log("📧 sendEmail:", sendEmail);
-
-    // ✅ Validate payload
     if (!Array.isArray(assignments)) {
       return res.status(400).json({ message: "Invalid assignments payload" });
     }
 
-    // ✅ Only admin can assign
     if (req.userRole !== "admin") {
       return res.status(403).json({ message: "Only admin can assign documents" });
     }
 
-    // ✅ Find document
     const doc = await Document.findById(req.params.id);
-    if (!doc) {
-      return res.status(404).json({ message: "Document not found" });
-    }
+    if (!doc) return res.status(404).json({ message: "Document not found" });
 
-    // ✅ Filter valid assignments
     const validAssignments = assignments.filter(
       (a) =>
         mongoose.Types.ObjectId.isValid(a.userId) &&
@@ -500,9 +508,6 @@ router.post("/:id/assign", isAuth, async (req, res) => {
         (a.permissions.view || a.permissions.download || a.permissions.update)
     );
 
-    console.log("✅ Valid Assignments:", validAssignments.length);
-
-    // ✅ Save assignments
     doc.assignedTo = validAssignments.map((a) => ({
       userId: new mongoose.Types.ObjectId(a.userId),
       permissions: {
@@ -515,71 +520,41 @@ router.post("/:id/assign", isAuth, async (req, res) => {
 
     await doc.save();
 
-    console.log("💾 Document saved successfully");
-
-    // ================= EMAIL NOTIFICATION =================
+    // Send email notifications
     if (sendEmail && validAssignments.length > 0) {
-      console.log("📨 Sending Emails...");
-
       for (const a of validAssignments) {
         try {
           const user = await User.findById(a.userId);
-
-          console.log("👤 User found:", user?.email);
-
-          if (!user || !user.email) {
-            console.log("⚠️ Skipping user (no email)");
-            continue;
-          }
+          if (!user || !user.email) continue;
 
           const permissions = [];
           if (a.permissions.view) permissions.push("View");
           if (a.permissions.download) permissions.push("Download");
           if (a.permissions.update) permissions.push("Update");
 
-          const info = await transporter.sendMail({
+          await transporter.sendMail({
             from: `"DocVault" <${process.env.EMAIL_USER}>`,
             to: user.email,
             subject: "📄 New Document Assigned",
             html: `
               <div style="font-family: Arial, sans-serif; padding: 10px;">
                 <h2 style="color:#4f46e5;">📄 Document Assigned</h2>
-
                 <p>Hello <b>${user.firstname || "User"}</b>,</p>
-
                 <p>A new document has been assigned to you.</p>
-
                 <p><b>Document Name:</b> ${doc.filename}</p>
-
                 <p><b>Permissions:</b></p>
-                <ul>
-                  ${permissions.map(p => `<li>${p}</li>`).join("")}
-                </ul>
-
-                <br/>
-
-                
-                <br/><br/>
-
-                <p style="color:gray; font-size:12px;">
-                  This is an automated message from DocVault.
-                </p>
+                <ul>${permissions.map(p => `<li>${p}</li>`).join("")}</ul>
+                <p style="color:gray; font-size:12px;">This is an automated message from DocVault.</p>
               </div>
             `,
           });
-
-          console.log("✅ Email sent:", info.response);
-
         } catch (err) {
-          console.error("❌ Email failed for user:", a.userId);
-          console.error("❌ Error:", err.message);
+          console.error("Email failed for user:", a.userId, err.message);
         }
       }
-    } else {
-      console.log("⛔ Email skipped (checkbox not checked)");
     }
 
-    // ================= NOTIFICATIONS =================
+    // Create in-app notifications
     await Notification.deleteMany({ documentId: doc._id });
 
     if (validAssignments.length > 0) {
@@ -591,18 +566,17 @@ router.post("/:id/assign", isAuth, async (req, res) => {
         link: "/assigned-documents",
         read: false,
       }));
-
       await Notification.insertMany(notifications);
     }
 
     res.json({ message: "Document assigned successfully" });
-
   } catch (err) {
-    console.error("❌ ASSIGN ERROR FULL:", err);
+    console.error("ASSIGN ERROR:", err);
     res.status(500).json({ message: "Assignment failed" });
   }
 });
-// =================== GET SINGLE DOCUMENT ===================
+
+// GET SINGLE DOCUMENT
 router.get("/:id", isAuth, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id)
@@ -629,7 +603,5 @@ router.get("/:id", isAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch document" });
   }
 });
-
-
 
 export default router;

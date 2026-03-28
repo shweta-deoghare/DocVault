@@ -53,28 +53,15 @@ const AssignedDocuments = () => {
   try {
 
     if (type === "view") {
-      const res = await API.get(
-        `/documents/${doc._id}/view`,
-        { ...config, responseType: "blob" }
-      );
-
-      const url = URL.createObjectURL(
-        new Blob([res.data], { type: doc.mimetype })
-      );
-
-      window.open(url);
+      const res = await API.get(`/documents/${doc._id}/view`, config);
+      window.open(res.data.url, "_blank");
     }
 
     if (type === "download") {
-      const res = await API.get(
-        `/documents/${doc._id}/download`,
-        { ...config, responseType: "blob" }
-      );
-
-      const url = URL.createObjectURL(new Blob([res.data]));
+      const res = await API.get(`/documents/${doc._id}/download`, config);
       const a = document.createElement("a");
-      a.href = url;
-      a.download = doc.filename;
+      a.href = res.data.url;
+      a.target = "_blank";
       a.click();
     }
 

@@ -111,23 +111,15 @@ const executeSecureAction = async (doc, type, config = {}) => {
     let res;
 
     if (type === "view") {
-      res = await API.get(`/documents/${doc._id}/view`, {
-        ...config,
-        responseType: "blob",
-      });
-
-      window.open(URL.createObjectURL(res.data));
+      res = await API.get(`/documents/${doc._id}/view`, config);
+      window.open(res.data.url, "_blank");
     }
 
     if (type === "download") {
-      res = await API.get(`/documents/${doc._id}/download`, {
-        ...config,
-        responseType: "blob",
-      });
-
+      res = await API.get(`/documents/${doc._id}/download`, config);
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(res.data);
-      a.download = doc.filename;
+      a.href = res.data.url;
+      a.target = "_blank";
       a.click();
     }
 
